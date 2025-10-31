@@ -91,13 +91,14 @@ else
   echo
 fi
 
-# ========================
-# SCRIPT STARTS HERE
-# ========================
-
+#!/usr/bin/env bash
+# Js-endpoint-harvester.sh (optimized with parallelism + Interlace integration for multi-target)
+# Usage:
+# ./Js-endpoint-harvester.sh example.com
+# ./Js-endpoint-harvester.sh -f targets.txt
+# Note: If Interlace is installed and -f is used, targets will be processed in parallel using Interlace.
 set -uo pipefail
 IFS=$'\n\t'
-
 # --------------------
 # Input parsing
 # --------------------
@@ -141,7 +142,7 @@ extract_domain() {
 # --------------------
 # Dependencies (warn only)
 # --------------------
-REQS=(~/go/bin/waybackurls ~/go/bin/gau ~/go/bin/hakrawler httpx python3 jq curl sort sha1sum katana arjun ~/go/bin/gospider paramspider ~/CeWL/cewl.rb gf parallel interlace)
+REQS=(waybackurls gau hakrawler httpx python3 jq curl sort sha1sum katana arjun gospider paramspider cewl gf parallel interlace)
 for r in "${REQS[@]}"; do
   if ! command -v "$r" >/dev/null 2>&1; then
     echo "[!] Warning: $r not found (some phases may be skipped)."
@@ -211,12 +212,12 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   # Parallel: waybackurls and gau (independent)
   WAYBACK_PID=""
   GAU_PID=""
-  if command -v ~/go/bin/waybackurls >/dev/null 2>&1; then
+  if command -v waybackurls >/dev/null 2>&1; then
     echo " - waybackurls (parallel)"
     (echo "$TARGET_RAW" | waybackurls > "$RAW_DIR/wayback.txt" 2>/dev/null || true) &
     WAYBACK_PID=$!
   fi
-  if command -v ~/go/bingau >/dev/null 2>&1; then
+  if command -v gau >/dev/null 2>&1; then
     echo " - gau (parallel)"
     (gau "$TARGET_RAW" > "$RAW_DIR/gau.txt" 2>/dev/null || true) &
     GAU_PID=$!
@@ -235,7 +236,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     echo "$FINAL_URL" > "$RAW_ENDPOINTS"
   fi
   # Sequential: hakrawler (depends on initial raw)
-  if command -v ~/go/bin/hakrawler >/dev/null 2>&1; then
+  if command -v hakrawler >/dev/null 2>&1; then
     echo " - hakrawler (sequential)"
     cat "$RAW_ENDPOINTS" | hakrawler -subs -d 2 > "$RAW_DIR/haka.txt" 2>/dev/null || true
     grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/haka.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
@@ -248,7 +249,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     (timeout 120 katana -u "$FINAL_URL" -d 3 -jc -hl -silent -o "$RAW_DIR/katana.txt" 2>/dev/null || true) &
     KATANA_PID=$!
   fi
-  if command -v ~/go/bin/gospider >/dev/null 2>&1; then
+  if command -v gospider >/dev/null 2>&1; then
     echo " - gospider (parallel)"
     (gospider -s "$FINAL_URL" -d 3 -c 10 -t 20 --quiet > "$RAW_DIR/gospider.txt" 2>/dev/null || true) &
     GOSPIDER_PID=$!
@@ -279,7 +280,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   # Phase 1.5: Scrape words for parameter enumeration (CeWL)
   # --------------------
   echo "[+] Phase 1.5: Scraping words with CeWL for parameter wordlist..."
-  if command -v ~/CeWL/cewl.rb >/dev/null 2>&1; then
+  if command -v cewl >/dev/null 2>&1; then
     cewl -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>/dev/null || true
     CEWL_COUNT=$(wc -l < "$CEWL_WORDLIST" 2>/dev/null || echo 0)
     echo " - CeWL wordlist generated: $CEWL_COUNT words"
