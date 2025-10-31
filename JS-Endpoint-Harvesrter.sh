@@ -40,7 +40,7 @@ figlet_splash() {
 "   ${BOLD}${YELLOW}       \\/  \\/  ${BOLD}${GREEN}JS ENDPOINT HARVESTER ${BOLD}${RED}v1.0${RESET}"
   )
 
-  local SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration${RESET}"
+  local SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration BY Clark Voss${RESET}"
   local TOOLS="${CYAN}• LinkFinder • SecretFinder • Arjun • ParamSpider • GF • httpx • katana • gospider${RESET}"
 
   clear
