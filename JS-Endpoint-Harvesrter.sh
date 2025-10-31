@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 # Js-endpoint-harvester.sh (with PROGRESS BARS + VERBOSE LOGGING)
 # Usage: ./Js-endpoint-harvester.sh [-v] <target> | [-v] -f targets.txt
-# =============================================
+#!/usr/bin/env bash
+# ========================
 # JS ENDPOINT HARVESTER v1.0
-# Matrix Rain + Animated Splash + Progress Bars
-# =============================================
+# Animated + Colored + Figlet-Style Splash
+# ========================
 
-set -uo pipefail
-IFS=$'\n\t'
-
-# --------------------
-# COLORS & TPUT
-# --------------------
+# Colors
 RED=$(tput setaf 1)
 GREEN=$(tput setaf 2)
 YELLOW=$(tput setaf 3)
@@ -21,13 +17,9 @@ CYAN=$(tput setaf 6)
 WHITE=$(tput setaf 7)
 BOLD=$(tput bold)
 RESET=$(tput sgr0)
-DIM=$(tput dim)
 
-# --------------------
-# ANIMATED FIGLET SPLASH
-# --------------------
-figlet_splash() {
-  local FIGLET_LINES=(
+# Figlet-style custom font (hand-crafted)
+FIGLET_LINES=(
 "   ${BOLD}${MAGENTA}   _ ____    ____  _   _ _   _ _     _     ${RESET}"
 "   ${BOLD}${MAGENTA}  | |  _ \  / ___|| | | | \ | | |   | |    ${RESET}"
 "   ${BOLD}${MAGENTA}  | | | | | \___ \| | | |  \| | |   | |    ${RESET}"
@@ -38,58 +30,75 @@ figlet_splash() {
 "   ${BOLD}${CYAN}     \\ \\/  \\/ /    |  __/| |_| | |\\  |  ${RESET}"
 "   ${BOLD}${CYAN}      \\  /\\  /     |_|    \\___/|_| \\_|  ${RESET}"
 "   ${BOLD}${YELLOW}       \\/  \\/  ${BOLD}${GREEN}JS ENDPOINT HARVESTER ${BOLD}${RED}v1.0${RESET}"
-  )
+)
 
-  local SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration BY Clark Voss${RESET}"
-  local TOOLS="${CYAN}• LinkFinder • SecretFinder • Arjun • ParamSpider • GF • httpx • katana • gospider${RESET}"
+# Subtitle
+SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration${RESET}"
+TOOLS="${CYAN}• LinkFinder • SecretFinder • Arjun • ParamSpider • GF • httpx • katana • gospider${RESET}"
 
+# Animation function
+animate_splash() {
   clear
+  local delay=0.03
+  local line
+
+  # Typewriter effect for figlet
   for line in "${FIGLET_LINES[@]}"; do
     for ((i=0; i<${#line}; i++)); do
       printf "%s" "${line:$i:1}"
-      [[ "${line:$i:1}" =~ [a-zA-Z0-9] ]] && sleep 0.008
+      [[ "${line:$i:1}" =~ [a-zA-Z0-9] ]] && sleep 0.01
     done
     echo
+    sleep 0.05
   done
 
+  # Fade in subtitle
   echo
   for ((i=0; i<${#SUBTITLE}; i++)); do
     printf "%s" "${SUBTITLE:$i:1}"
-    sleep 0.015
+    sleep 0.02
   done
   echo
+  echo
+
+  # Tools line
   echo -e "$TOOLS"
   echo
 
+  # Pulse version number
   for _ in {1..3}; do
     echo -e "${BOLD}${RED}          >>> HARVESTING ENDPOINTS <<<${RESET}"
-    sleep 0.35
+    sleep 0.4
     echo -e "${BOLD}${YELLOW}          >>> HARVESTING ENDPOINTS <<<${RESET}"
-    sleep 0.35
+    sleep 0.4
   done
 
+  echo
   sleep 1.2
   clear
 }
 
-# --------------------
-# RUN SPLASH (only in terminal)
-# --------------------
+# Run animation only in interactive terminal
 if [[ -t 1 ]]; then
-  matrix_rain
-  figlet_splash
+  animate_splash
 else
-  # Non-interactive: skip animation
-  echo "JS ENDPOINT HARVESTER v1.0"
-  echo "JavaScript-Driven Endpoint Discovery"
+  # Non-interactive: just print static version
+  for line in "${FIGLET_LINES[@]}"; do echo -e "$line"; done
+  echo -e "$SUBTITLE"
+  echo -e "$TOOLS"
+  echo
 fi
 
+# ========================
+# SCRIPT STARTS HERE
+# ========================
+
+set -uo pipefail
+IFS=$'\n\t'
+
 # --------------------
-# FLAGS & INPUT
+# Flags
 # --------------------
-VERBOSE=0
-FILE_MODE=0
-TARGETS=()
 VERBOSE=0
 FILE_MODE=0
 TARGETS=()
@@ -156,7 +165,7 @@ log() {
 # --------------------
 # Dependency check
 # --------------------
-REQS=(~/go/bin/waybackurls ~/go/bin/gau ~/go/bin/hakrawler httpx katana arjun ~/go/bin/gospider paramspider ~/CeWL/cewl.rb gf parallel curl jq sort)
+REQS=(waybackurls gau hakrawler httpx katana arjun gospider paramspider cewl gf parallel curl jq sort)
 for r in "${REQS[@]}"; do
   command -v "$r" >/dev/null 2>&1 || log "WARN" "$r not found"
 done
@@ -223,11 +232,11 @@ for TARGET_RAW in "${TARGETS[@]}"; do
 
   WAYBACK_PID="" GAU_PID="" KATANA_PID="" GOSPIDER_PID=""
 
-  if command -v ~/go/bin/waybackurls >/dev/null; then
+  if command -v waybackurls >/dev/null; then
     (echo "$TARGET_RAW" | waybackurls > "$RAW_DIR/wayback.txt" 2>"$OUT_DIR/wayback.err") &
     WAYBACK_PID=$!
   fi
-  if command -v ~/go/bin/gau >/dev/null; then
+  if command -v gau >/dev/null; then
     (gau "$TARGET_RAW" > "$RAW_DIR/gau.txt" 2>"$OUT_DIR/gau.err") &
     GAU_PID=$!
   fi
@@ -238,7 +247,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
 
   [[ ! -s "$RAW_ENDPOINTS" ]] && echo "$FINAL_URL" > "$RAW_ENDPOINTS"
 
-  if command -v ~/go/bin/hakrawler >/dev/null; then
+  if command -v hakrawler >/dev/null; then
     cat "$RAW_ENDPOINTS" | hakrawler -subs -d 2 > "$RAW_DIR/haka.txt" 2>"$OUT_DIR/haka.err"
     grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/haka.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS"
   fi
@@ -247,7 +256,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     (timeout 120 katana -u "$FINAL_URL" -d 3 -jc -hl -silent -o "$RAW_DIR/katana.txt" 2>"$OUT_DIR/katana.err") &
     KATANA_PID=$!
   fi
-  if command -v ~/go/bin/gospider >/dev/null; then
+  if command -v gospider >/dev/null; then
     (gospider -s "$FINAL_URL" -d 3 -c 10 -t 20 --quiet > "$RAW_DIR/gospider.txt" 2>"$OUT_DIR/gospider.err") &
     GOSPIDER_PID=$!
   fi
@@ -269,8 +278,8 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   log "INFO" "Total harvested endpoints: $(wc -l < "$RAW_ENDPOINTS")"
 
   # CeWL
-  if command -v ~/CeWL/cewl.rb >/dev/null; then
-    ~/CeWL/cewl.rb -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>"$OUT_DIR/cewl.err"
+  if command -v cewl >/dev/null; then
+    cewl -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>"$OUT_DIR/cewl.err"
     log "INFO" "CeWL wordlist: $(wc -l < "$CEWL_WORDLIST") words"
   fi
 
@@ -331,15 +340,15 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   JS_FILES=("$JS_DIR"/*.js)
   JS_FILES_COUNT=${#JS_FILES[@]}
 
-  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f ~/LinkFinder/linkfinder.py ]] || command -v linkfinder >/dev/null; then
+  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f /opt/LinkFinder/linkfinder.py ]] || command -v linkfinder >/dev/null; then
     log "INFO" "Phase 4: Running LinkFinder..."
     i=0
     for js in "${JS_FILES[@]}"; do
       ((i++))
       [[ ! -f "$js" ]] && continue
       base=$(basename "$js")
-      if [[ -f ~/LinkFinder/linkfinder.py ]]; then
-        python3.9 ~/LinkFinder/linkfinder.py -i "$js" -o cli 2>/dev/null | sed '/^\s*$/d' > "$LINKFINDER_DIR/${base}.txt"
+      if [[ -f /opt/LinkFinder/linkfinder.py ]]; then
+        python3 /opt/LinkFinder/linkfinder.py -i "$js" -o cli 2>/dev/null | sed '/^\s*$/d' > "$LINKFINDER_DIR/${base}.txt"
       else
         linkfinder -i "$js" -o cli > "$LINKFINDER_DIR/${base}.txt" 2>/dev/null
       fi
@@ -348,15 +357,15 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     echo
   fi
 
-  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f ~/SecretFinder/SecretFinder.py ]] || command -v SecretFinder >/dev/null; then
+  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f /opt/SecretFinder/SecretFinder.py ]] || command -v SecretFinder >/dev/null; then
     log "INFO" "Phase 4: Running SecretFinder..."
     i=0
     for js in "${JS_FILES[@]}"; do
       ((i++))
       [[ ! -f "$js" ]] && continue
       base=$(basename "$js")
-      if [[ -f ~/SecretFinder/SecretFinder.py ]]; then
-        python3.9 ~/SecretFinder/SecretFinder.py -i "$js" -o cli 2>/dev/null > "$SECRETFINDER_DIR/${base}.txt"
+      if [[ -f /opt/SecretFinder/SecretFinder.py ]]; then
+        python3 /opt/SecretFinder/SecretFinder.py -i "$js" -o cli 2>/dev/null > "$SECRETFINDER_DIR/${base}.txt"
       else
         SecretFinder -i "$js" -o cli > "$SECRETFINDER_DIR/${base}.txt" 2>/dev/null
       fi
