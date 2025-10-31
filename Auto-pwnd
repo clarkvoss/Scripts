@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# automate_scans.sh (patched: portable Python filter via temp file + --dry-run)
+# Usage:
+#   ./automate_scans.sh OUT/example.com
+#   ./automate_scans.sh OUT/example.com --fast
+#   ./automate_scans.sh OUT/example.com --aggressive
+#   ./automate_scans.sh OUT/example.com --dry-run
+#   ./automate_scans.sh OUT/example.com --yes
+
+set -euo pipefail
+IFS=$'\n\t'
+
+usage(){
+  cat <<USAGE
+Usage: $0 <OUT/target_dir> [--fast] [--aggressive] [--dry-run] [--yes]
+
+OUT/target_dir must be the folder created by Js-endpoint-harvester (contains js/ and findings/).
+
+Options:
+  --fast        Skip slower/optional phases (arjun, full ffuf, retire).
+  --aggressive  Use more aggressive scanner options (HIGHER RISK). Use with caution.
+  --dry-run     Print actions that would be taken (including commands) but do not execute scanners.
+  --yes         Don't prompt; assume yes.
+USAGE
+  exit 1
+}
+
+if [ "$#" -lt 1 ]; then usage; fi
+
+OUT_DIR="$1"
+shift || true
+
+FAST=0
+AGGRESSIVE=0
+ASSUME_YES=0
+DRY_RUN=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fast) FAST=1;;
+    --aggressive) AGGRESSIVE=1;;
+    --dry-run) DRY_RUN=1;;
+    --yes) ASSUME_YES=1;;
+    -h|--help) usage;;
+    *) echo "Unknown arg: $1"; usage;;
+  esac
+  shift
+done
+
+# Basic checks
+if [ ! -d "$OUT_DIR" ]; then
+  echo "ERROR: $OUT_DIR not found"
+  exit 2
+fi
+
+FIND_DIR="$OUT_DIR/findings"
+JS_DIR="$OUT_DIR/js"
+AUTOMATION_DIR="$OUT_DIR/automation"
+mkdir -p "$AUTOMATION_DIR"
+
+# Prefer validated endpoints; fallback to sorted unique, then candidates
+ENDPOINTS_FILE=""
+if [ -f "$FIND_DIR/validated_endpoints.txt" ] && [ -s "$FIND_DIR/validated_endpoints.txt" ]; then
+  ENDPOINTS_FILE="$FIND_DIR/validated_endpoints.txt"
+elif [ -f "$FIND_DIR/all_endpoints_uniq.txt" ] && [ -s "$FIND_DIR/all_endpoints_uniq.txt" ]; then
+  ENDPOINTS_FILE="$FIND_DIR/all_endpoints_uniq.txt"
+elif [ -f "$FIND_DIR/candidates.txt" ] && [ -s "$FIND_DIR/candidates.txt" ]; then
+  ENDPOINTS_FILE="$FIND_DIR/candidates.txt"
+else
+  echo "No endpoints found (no validated/all/candidates files). Exiting."
+  exit 2
+fi
+
+echo "Using endpoints file (pre-filter): $ENDPOINTS_FILE"
+echo "Outputs will be written under: $AUTOMATION_DIR"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[DRY RUN] Dry-run mode enabled — scanners will NOT be executed."
+fi
+
+# Tool helper: check presence
+have(){
+  command -v "$1" >/dev/null 2>&1
+}
+
+# Show which tools are available
+TOOLS_AVAILABLE=()
+for t in sqlmap dalfox xsstrike arjun ffuf retire httpx; do
+  if have "$t"; then TOOLS_AVAILABLE+=("$t"); fi
+done
+echo "Tools available: ${TOOLS_AVAILABLE[*]:-none}"
+
+# ---------------------------
+# In-scope filtering step (external python script, portable)
+# ---------------------------
+ALLOWED_DOMAINS_FILE="$FIND_DIR/allowed_domains.txt"
+if [ ! -f "$ALLOWED_DOMAINS_FILE" ]; then
+  DEFAULT_DOMAIN="$(basename "$OUT_DIR")"
+  echo "[+] No allowed_domains.txt found; creating $ALLOWED_DOMAINS_FILE with default: $DEFAULT_DOMAIN"
+  echo "$DEFAULT_DOMAIN" > "$ALLOWED_DOMAINS_FILE"
+else
+  echo "[+] Using allowed domains from: $ALLOWED_DOMAINS_FILE"
+fi
+
+ENDPOINTS_IN_SCOPE="$AUTOMATION_DIR/endpoints_in_scope.txt"
+
+# create a small temp python script (safe, avoids heredoc issues)
+TMP_PY="$(mktemp --tmpdir filter_endpoints.XXXXXX.py)"
+cat > "$TMP_PY" <<'PYCODE'
+#!/usr/bin/env python3
+# portable filter_endpoints.py
+import sys
+from urllib.parse import urlparse
+
+def load_allowed(path):
+    a=[]
+    try:
+        with open(path,'r',encoding='utf-8') as fh:
+            for ln in fh:
+                ln2=ln.strip()
+                if not ln2 or ln2.startswith('#'): continue
+                a.append(ln2.lower())
+    except Exception as e:
+        print("ERROR reading allowed file:", e, file=sys.stderr)
+        sys.exit(2)
+    return a
+
+def host_allowed(host, allowed):
+    if not host: return False
+    h=host.lower()
+    for a in allowed:
+        if h==a: return True
+        if h.endswith('.'+a): return True
+    return False
+
+def main(infile, allowedf, outfile):
+    allowed=load_allowed(allowedf)
+    kept=[]
+    try:
+        with open(infile,'r',encoding='utf-8',errors='ignore') as fh:
+            for ln in fh:
+                s=ln.strip()
+                if not s: continue
+                s=s.rstrip(' ,;)')
+                try:
+                    p=urlparse(s)
+                    host=p.hostname
+                except Exception:
+                    host=None
+                if host_allowed(host, allowed):
+                    kept.append(s)
+    except Exception as e:
+        print("ERROR reading endpoints file:", e, file=sys.stderr)
+        sys.exit(2)
+    try:
+        with open(outfile,'w',encoding='utf-8') as fh:
+            for l in kept:
+                fh.write(l+"\n")
+    except Exception as e:
+        print("ERROR writing output file:", e, file=sys.stderr)
+        sys.exit(2)
+    print("KEPT:"+str(len(kept)))
+    # exit normally
+if __name__ == "__main__":
+    if len(sys.argv)!=4:
+        print("Usage: filter_endpoints.py <in> <allowed> <out>", file=sys.stderr)
+        sys.exit(2)
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
+PYCODE
+
+chmod +x "$TMP_PY"
+
+# Run the temp python filter
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[DRY RUN] Would run: $TMP_PY \"$ENDPOINTS_FILE\" \"$ALLOWED_DOMAINS_FILE\" \"$ENDPOINTS_IN_SCOPE\""
+else
+  # execute and capture output
+  "$TMP_PY" "$ENDPOINTS_FILE" "$ALLOWED_DOMAINS_FILE" "$ENDPOINTS_IN_SCOPE" || {
+    echo "Python filter failed; see above errors"
+    rm -f "$TMP_PY"
+    exit 1
+  }
+fi
+
+# remove temp python script
+rm -f "$TMP_PY"
+
+# After python completes, check OUT file and counts
+IN_SCOPE_COUNT=0
+if [ -f "$ENDPOINTS_IN_SCOPE" ]; then
+  IN_SCOPE_COUNT=$(wc -l < "$ENDPOINTS_IN_SCOPE" 2>/dev/null || echo 0)
+fi
+TOTAL_PRE=$(wc -l < "$ENDPOINTS_FILE" 2>/dev/null || echo 0)
+echo "[+] Filtered endpoints: kept $IN_SCOPE_COUNT / $TOTAL_PRE (in-scope)"
+
+if [ "$IN_SCOPE_COUNT" -eq 0 ]; then
+  echo "ERROR: No in-scope endpoints found after filtering. Check $ALLOWED_DOMAINS_FILE or inspect $ENDPOINTS_FILE"
+  exit 1
+fi
+
+# Replace the endpoints file used by scanners with the in-scope file
+ENDPOINTS_FILE="$ENDPOINTS_IN_SCOPE"
+echo "[+] Scanners will use: $ENDPOINTS_FILE"
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  echo "Proceed with automated scans on the filtered list? (Only run against authorized targets) [y/N]"
+  read -r yn
+  if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+    echo "Aborting."
+    exit 0
+  fi
+fi
+
+# Utility: safe filename from URL
+safe_name(){
+  echo "$1" | sed -E 's~https?://~~; s/[^A-Za-z0-9._-]/_/g' | cut -c1-160
+}
+
+############################
+# 1) httpx re-validation (fast)
+############################
+if have httpx; then
+  echo "[httpx] Revalidating endpoints (quick) -> $AUTOMATION_DIR/httpx"
+  mkdir -p "$AUTOMATION_DIR/httpx"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY RUN] Would run: httpx -silent -status-code -threads 80 -l \"$ENDPOINTS_FILE\" -o \"$AUTOMATION_DIR/httpx/validated_httpx.txt\""
+  else
+    httpx -silent -status-code -threads 80 -l "$ENDPOINTS_FILE" -o "$AUTOMATION_DIR/httpx/validated_httpx.txt" || true
+  fi
+else
+  echo "[httpx] not installed, skipping"
+fi
+
+############################
+# 2) Lightweight SQLi checks with sqlmap (non-destructive)
+############################
+if have sqlmap; then
+  echo "[sqlmap] Running non-destructive checks (low-risk)"
+  mkdir -p "$AUTOMATION_DIR/sqlmap"
+  grep -E '\?+' "$ENDPOINTS_FILE" | sort -u > "$AUTOMATION_DIR/sqlmap/with_params.txt" || true
+  count=$(wc -l < "$AUTOMATION_DIR/sqlmap/with_params.txt" 2>/dev/null || echo 0)
+  echo "SQL: candidate endpoints with params: $count"
+  if [ "$count" -gt 0 ]; then
+    while read -r url; do
+      [ -z "$url" ] && continue
+      fname=$(safe_name "$url")
+      out="$AUTOMATION_DIR/sqlmap/${fname}.txt"
+      SQLMAP_ARGS=( -u "$url" --batch --random-agent --risk=1 --level=1 --threads=1 )
+      if [ "$AGGRESSIVE" -eq 1 ]; then
+        SQLMAP_ARGS+=( --risk=3 --level=3 )
+      fi
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[DRY RUN] Would run: sqlmap ${SQLMAP_ARGS[*]} > \"$out\" 2>&1"
+      else
+        echo "[sqlmap] $url -> $out"
+        sqlmap "${SQLMAP_ARGS[@]}" > "$out" 2>&1 || true
+      fi
+    done < "$AUTOMATION_DIR/sqlmap/with_params.txt"
+  fi
+else
+  echo "[sqlmap] not installed, skipping"
+fi
+
+############################
+# 3) XSS scanning: dalfox preferred, fallback xsstrike
+############################
+if have dalfox; then
+  echo "[dalfox] Scanning endpoints for XSS (light)"
+  mkdir -p "$AUTOMATION_DIR/dalfox"
+  target_list="$AUTOMATION_DIR/dalfox/targets.txt"
+  if grep -q '?' "$ENDPOINTS_FILE"; then
+    grep -E '\?+' "$ENDPOINTS_FILE" | sort -u > "$target_list"
+  else
+    head -n 200 "$ENDPOINTS_FILE" > "$target_list"
+  fi
+  while read -r url; do
+    [ -z "$url" ] && continue
+    fn=$(safe_name "$url")
+    out="$AUTOMATION_DIR/dalfox/${fn}.json"
+    if [ "$AGGRESSIVE" -eq 1 ]; then
+      cmd=(dalfox url "$url" --follow-redirect --skip-bav --context --format json -o "$out")
+    else
+      cmd=(dalfox url "$url" --format json -o "$out")
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[DRY RUN] Would run: ${cmd[*]}"
+    else
+      "${cmd[@]}" || true
+      echo "[dalfox] scanned: $url -> $out"
+    fi
+  done < "$target_list"
+elif have xsstrike; then
+  echo "[xsstrike] xsstrike present — running light scans"
+  mkdir -p "$AUTOMATION_DIR/xsstrike"
+  while read -r url; do
+    [ -z "$url" ] && continue
+    fn=$(safe_name "$url")
+    out="$AUTOMATION_DIR/xsstrike/${fn}.txt"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[DRY RUN] Would run: xsstrike -u \"$url\" -o \"$out\""
+    else
+      xsstrike -u "$url" -o "$out" 2>/dev/null || true
+      echo "[xsstrike] $url"
+    fi
+  done < <(grep -E '\?+' "$ENDPOINTS_FILE" || true)
+else
+  echo "XSS tools (dalfox/xsstrike) not installed; skipping XSS scanning"
+fi
+
+############################
+# 4) Parameter discovery: arjun (if available)
+############################
+if [ "$FAST" -eq 0 ] && have arjun; then
+  echo "[arjun] Running parameter discovery (this can be slow)"
+  mkdir -p "$AUTOMATION_DIR/arjun"
+  targets=$(mktemp)
+  if grep -q '?' "$ENDPOINTS_FILE"; then
+    grep -E '\?+' "$ENDPOINTS_FILE" > "$targets"
+  else
+    head -n 200 "$ENDPOINTS_FILE" > "$targets"
+  fi
+  while read -r url; do
+    [ -z "$url" ] && continue
+    out="$AUTOMATION_DIR/arjun/$(safe_name "$url").txt"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[DRY RUN] Would run: arjun -u \"$url\" -oT \"$out\""
+    else
+      arjun -u "$url" -oT "$out" || true
+      echo "[arjun] $url -> $out"
+    fi
+  done < "$targets"
+  rm -f "$targets"
+else
+  echo "[arjun] not installed or --fast used; skipping arjun"
+fi
+
+############################
+# 5) Parameter fuzzing with ffuf using params_wordlist
+############################
+if have ffuf; then
+  echo "[ffuf] Parameter fuzzing (using params_wordlist.txt if available)"
+  mkdir -p "$AUTOMATION_DIR/ffuf"
+  PWORD="$FIND_DIR/params_wordlist.txt"
+  if [ ! -f "$PWORD" ] || [ ! -s "$PWORD" ]; then
+    echo "  - no params_wordlist.txt found; using small default list"
+    printf "id\npage\nuser\ntoken\nauth\nq\nquery\nnext\nlimit\noffset\n" > "$AUTOMATION_DIR/ffuf/default_params.txt"
+    PWORD="$AUTOMATION_DIR/ffuf/default_params.txt"
+  fi
+
+  grep -E '\?+' "$ENDPOINTS_FILE" | head -n 200 | while read -r url; do
+    [ -z "$url" ] && continue
+    template=$(echo "$url" | sed -E 's/([?&][^=]+)=([^&]*)/\1=FUZZ/')
+    out="$AUTOMATION_DIR/ffuf/$(safe_name "$template").json"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[DRY RUN] Would run: ffuf -w \"$PWORD\" -u \"$template\" -fs 0 -t 20 -o \"$out\""
+    else
+      ffuf -w "$PWORD" -u "$template" -fs 0 -t 20 -v -o "$out" 2>/dev/null || true
+      echo "[ffuf] fuzzed: $template -> $out"
+    fi
+  done
+else
+  echo "[ffuf] not installed; skipping ffuf parameter fuzzing"
+fi
+
+############################
+# 6) Retire.js scan for vulnerable libs in downloaded JS
+############################
+if [ "$FAST" -eq 0 ] && have retire; then
+  echo "[retire] Scanning JS files for known vulnerable libraries"
+  mkdir -p "$AUTOMATION_DIR/retire"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[DRY RUN] Would run: retire --path \"$JS_DIR\" --outputpath \"$AUTOMATION_DIR/retire/report.json\""
+  else
+    retire --path "$JS_DIR" --outputpath "$AUTOMATION_DIR/retire/report.json" 2>/dev/null || true
+    echo "[retire] report: $AUTOMATION_DIR/retire/report.json"
+  fi
+else
+  echo "[retire] not installed or --fast used; skipping retire"
+fi
+
+############################
+# Done
+############################
+echo "[+] Automation complete. Results are under: $AUTOMATION_DIR"
+echo "Quick list of output files (if any were produced):"
+find "$AUTOMATION_DIR" -maxdepth 2 -type f -print | sed 's#^# - #' || true
+echo
+echo "Notes:"
+echo " - The filter step used allowed domains from: $ALLOWED_DOMAINS_FILE"
+echo " - Dry-run mode: $([ "$DRY_RUN" -eq 1 ] && echo "ENABLED" || echo "disabled")"
+echo " - To actually run scanners, re-run without --dry-run."
+echo
+echo "If you want, I can add:"
+echo " - a --burp flag to produce Burp Intruder CSV payloads,"
+echo " - auto-generated ffuf jobs that fuzz path segments,"
+echo " - parallel worker support with a threads flag."
+echo
