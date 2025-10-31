@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Js-endpoint-harvester.sh (final single-file version + Katana + Arjun)
+# Js-endpoint-harvester.sh (optimized with parallelism + Interlace integration for multi-target)
 # Usage:
 # ./Js-endpoint-harvester.sh example.com
 # ./Js-endpoint-harvester.sh -f targets.txt
+# Note: If Interlace is installed and -f is used, targets will be processed in parallel using Interlace.
 set -uo pipefail
 IFS=$'\n\t'
-
 # --------------------
 # Input parsing
 # --------------------
@@ -13,8 +13,6 @@ if [ "$#" -eq 0 ]; then
   echo "Usage: $0 <target> OR $0 -f targets.txt"
   exit 2
 fi
-
-TARGETS=()
 if [ "$1" = "-f" ]; then
   if [ "$#" -ne 2 ]; then
     echo "Usage: $0 -f targets.txt"
@@ -25,31 +23,42 @@ if [ "$1" = "-f" ]; then
     echo "File not found: $FILE"
     exit 2
   fi
-  mapfile -t TARGETS < "$FILE"
+  if command -v interlace >/dev/null 2>&1; then
+    echo "[+] Using Interlace for parallel processing of multiple targets."
+    interlace -tL "$FILE" -threads 10 -c "$0 _target_"
+    exit 0
+  else
+    echo "[!] Interlace not found, processing targets sequentially."
+    mapfile -t TARGETS < "$FILE"
+  fi
 else
-  TARGETS+=("$1")
+  TARGETS=("$1")
 fi
-
 # --------------------
 # Helper: sanitize a target for directory naming
 # --------------------
 sanitize_target() {
   echo "$1" | sed -E 's~https?://~~' | sed 's:/*$::' | sed 's/[^a-zA-Z0-9._-]/_/g'
 }
-
+# --------------------
+# Helper: extract domain for filtering
+# --------------------
+extract_domain() {
+  echo "$1" | sed -E 's~https?://~~' | sed 's~/.*~~' | sed 's/:[0-9]+//'
+}
 # --------------------
 # Dependencies (warn only)
 # --------------------
-REQS=(waybackurls gau hakrawler httpx python3 jq curl sort sha1sum katana arjun)
+REQS=(waybackurls gau hakrawler httpx python3 jq curl sort sha1sum katana arjun gospider paramspider cewl gf parallel interlace)
 for r in "${REQS[@]}"; do
   if ! command -v "$r" >/dev/null 2>&1; then
     echo "[!] Warning: $r not found (some phases may be skipped)."
   fi
 done
-
 # Enhanced secret regex battery
 SECRET_REGEX="(AIza[0-9A-Za-z\\-_]{35})|(sk_live_[0-9A-Za-z]{24,})|(AKIA[0-9A-Z]{16})|(ghp_[0-9A-Za-z]{36})|(xoxa-[0-9A-Za-z-]{10,})|(xox[baprs]-[0-9a-zA-Z-]{10,})|([A-Za-z0-9_-]{20,}:?[A-Za-z0-9_\-]{20,})|(eyJ[A-Za-z0-9_\-\.]{10,})|(postgres:\/\/[^ \"']+)|(mysql:\/\/[^ \"']+)|(api_key[\"']?\s*[:=]\s*[A-Za-z0-9_\-]{16,})"
-
+# Expanded GF patterns for endpoints/vulns
+GF_PATTERNS=(xss sqli ssrf redirect lfi rce ssti admin api cors graphql idor secrets debug)
 # --------------------
 # Main per-target loop
 # --------------------
@@ -57,8 +66,8 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   echo "========================================"
   echo "Processing target: $TARGET_RAW"
   echo "========================================"
-
   TARGET_DOMAIN=$(sanitize_target "$TARGET_RAW")
+  TARGET_FILTER=$(extract_domain "$TARGET_RAW")
   OUT_DIR="OUT/${TARGET_DOMAIN}"
   RAW_DIR="$OUT_DIR/raw_urls"
   JS_DIR="$OUT_DIR/js"
@@ -66,10 +75,10 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   LINKFINDER_DIR="$FIND_DIR/linkfinder"
   SECRETFINDER_DIR="$FIND_DIR/secrets"
   REPORT_DIR="$FIND_DIR/reports"
-
+  WORDLIST_DIR="$FIND_DIR/wordlists"
+  GF_DIR="$FIND_DIR/gf"
   # Create required directories
-  mkdir -p "$RAW_DIR" "$JS_DIR" "$FIND_DIR" "$LINKFINDER_DIR" "$SECRETFINDER_DIR" "$REPORT_DIR"
-
+  mkdir -p "$RAW_DIR" "$JS_DIR" "$FIND_DIR" "$LINKFINDER_DIR" "$SECRETFINDER_DIR" "$REPORT_DIR" "$WORDLIST_DIR" "$GF_DIR"
   # File paths
   RAW_ENDPOINTS="$FIND_DIR/raw_endpoints.txt"
   JS_CANDIDATES_FILE="$JS_DIR/js_candidates.txt"
@@ -82,8 +91,9 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   PARAMLESS_FILE="$FIND_DIR/paramless_endpoints.txt"
   ARJUN_PARAMS="$FIND_DIR/arjun_params.txt"
   KATANA_VALIDATED="$FIND_DIR/katana_validated.txt"
+  PARAMSPIDER_PARAMS="$FIND_DIR/paramspider_params.txt"
+  CEWL_WORDLIST="$WORDLIST_DIR/cewl_wordlist.txt"
   HTML_REPORT="$REPORT_DIR/report.html"
-
   # Initialize files
   : > "$RAW_ENDPOINTS"
   : > "$JS_CANDIDATES_FILE"
@@ -96,92 +106,118 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   : > "$PARAMLESS_FILE"
   : > "$ARJUN_PARAMS"
   : > "$KATANA_VALIDATED"
-
+  : > "$PARAMSPIDER_PARAMS"
+  : > "$CEWL_WORDLIST"
   # Resolve final URL
   FINAL_URL=$(curl -kLs -o /dev/null -w '%{url_effective}' "https://${TARGET_DOMAIN}" 2>/dev/null || true)
   [ -z "$FINAL_URL" ] && FINAL_URL="https://${TARGET_DOMAIN}"
   echo "[+] Final URL: $FINAL_URL"
-
   # --------------------
-  # Phase 1: Harvest endpoints (waybackurls, gau, hakrawler, katana)
+  # Phase 1: Harvest endpoints (parallel where possible)
   # --------------------
   echo "[+] Phase 1: Harvesting endpoints..."
-
-  # waybackurls
+  # Parallel: waybackurls and gau (independent)
+  WAYBACK_PID=""
+  GAU_PID=""
   if command -v waybackurls >/dev/null 2>&1; then
-    echo " - waybackurls"
-    echo "$TARGET_RAW" | waybackurls > "$RAW_DIR/wayback.txt" 2>/dev/null || true
-    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/wayback.txt" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    echo " - waybackurls (parallel)"
+    (echo "$TARGET_RAW" | waybackurls > "$RAW_DIR/wayback.txt" 2>/dev/null || true) &
+    WAYBACK_PID=$!
   fi
-
-  # gau
   if command -v gau >/dev/null 2>&1; then
-    echo " - gau"
-    gau "$TARGET_RAW" > "$RAW_DIR/gau.txt" 2>/dev/null || true
-    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/gau.txt" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    echo " - gau (parallel)"
+    (gau "$TARGET_RAW" > "$RAW_DIR/gau.txt" 2>/dev/null || true) &
+    GAU_PID=$!
   fi
-
-  # seed with final URL
+  wait ${WAYBACK_PID} ${GAU_PID} 2>/dev/null || true
+  # Process wayback
+  if [ -n "$WAYBACK_PID" ] && [ -f "$RAW_DIR/wayback.txt" ]; then
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/wayback.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+  fi
+  # Process gau
+  if [ -n "$GAU_PID" ] && [ -f "$RAW_DIR/gau.txt" ]; then
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/gau.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+  fi
+  # Seed with final URL
   if [ ! -s "$RAW_ENDPOINTS" ]; then
     echo "$FINAL_URL" > "$RAW_ENDPOINTS"
   fi
-
-  # hakrawler
+  # Sequential: hakrawler (depends on initial raw)
   if command -v hakrawler >/dev/null 2>&1; then
-    echo " - hakrawler (subs)"
+    echo " - hakrawler (sequential)"
     cat "$RAW_ENDPOINTS" | hakrawler -subs -d 2 > "$RAW_DIR/haka.txt" 2>/dev/null || true
-    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/haka.txt" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/haka.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
   fi
-
-  # katana - modern crawler
+  # Parallel: katana and gospider (independent crawlers)
+  KATANA_PID=""
+  GOSPIDER_PID=""
   if command -v katana >/dev/null 2>&1; then
-    echo " - katana (depth 3, js+headless)"
-    timeout 120 katana -u "$FINAL_URL" -d 3 -jc -hl -silent -o "$RAW_DIR/katana.txt" 2>/dev/null || true
-    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/katana.txt" >> "$RAW_ENDPOINTS" 2>/dev/null || true
-    grep -Eo "https?://[^'\" ]+\.js(\?[^'\" ]*)?" "$RAW_DIR/katana.txt" >> "$JS_CANDIDATES_FILE" 2>/dev/null || true
+    echo " - katana (parallel)"
+    (timeout 120 katana -u "$FINAL_URL" -d 3 -jc -hl -silent -o "$RAW_DIR/katana.txt" 2>/dev/null || true) &
+    KATANA_PID=$!
   fi
-
-  # root page
+  if command -v gospider >/dev/null 2>&1; then
+    echo " - gospider (parallel)"
+    (gospider -s "$FINAL_URL" -d 3 -c 10 -t 20 --quiet > "$RAW_DIR/gospider.txt" 2>/dev/null || true) &
+    GOSPIDER_PID=$!
+  fi
+  wait ${KATANA_PID} ${GOSPIDER_PID} 2>/dev/null || true
+  # Process katana
+  if [ -n "$KATANA_PID" ] && [ -f "$RAW_DIR/katana.txt" ]; then
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/katana.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    grep -Eo "https?://[^'\" ]+\.js(\?[^'\" ]*)?" "$RAW_DIR/katana.txt" | grep -i "$TARGET_FILTER" >> "$JS_CANDIDATES_FILE" 2>/dev/null || true
+  fi
+  # Process gospider
+  if [ -n "$GOSPIDER_PID" ] && [ -f "$RAW_DIR/gospider.txt" ]; then
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/gospider.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    grep -Eo "https?://[^'\" ]+\.js(\?[^'\" ]*)?" "$RAW_DIR/gospider.txt" | grep -i "$TARGET_FILTER" >> "$JS_CANDIDATES_FILE" 2>/dev/null || true
+  fi
+  # Sequential: root page (fast)
   if command -v curl >/dev/null 2>&1; then
     echo " - fetching root page"
     curl -k -sL "$FINAL_URL" -o "$RAW_DIR/root.html" || touch "$RAW_DIR/root.html"
-    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/root.html" >> "$RAW_ENDPOINTS" 2>/dev/null || true
+    grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/root.html" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS" 2>/dev/null || true
   fi
-
-  # deduplicate
+  # Deduplicate
   sort -u "$RAW_ENDPOINTS" -o "$RAW_ENDPOINTS" || true
   echo "[+] Total harvested endpoints: $(wc -l < "$RAW_ENDPOINTS" 2>/dev/null || echo 0)"
-
-  # extract param'd URLs
+  # Extract param'd URLs
   grep -Eo "https?://[^?]+\?[^ \"'<>]+" "$RAW_ENDPOINTS" | sort -u > "$FIND_DIR/params.txt" 2>/dev/null || true
-
+  # --------------------
+  # Phase 1.5: Scrape words for parameter enumeration (CeWL)
+  # --------------------
+  echo "[+] Phase 1.5: Scraping words with CeWL for parameter wordlist..."
+  if command -v cewl >/dev/null 2>&1; then
+    cewl -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>/dev/null || true
+    CEWL_COUNT=$(wc -l < "$CEWL_WORDLIST" 2>/dev/null || echo 0)
+    echo " - CeWL wordlist generated: $CEWL_COUNT words"
+  else
+    echo " - CeWL not installed; skipping wordlist generation."
+  fi
   # --------------------
   # Phase 2: JS discovery
   # --------------------
   echo "[+] Phase 2: Extracting JS assets..."
-
-  # from harvested lists
+  # From harvested lists
   for f in "$RAW_DIR"/*.txt; do
     [ -f "$f" ] || continue
-    grep -Eo "https?://[^'\" ]+\.js(\?[^'\" ]*)?" "$f" || true
+    grep -Eo "https?://[^'\" ]+\.js(\?[^'\" ]*)?" "$f" | grep -i "$TARGET_FILTER" || true
   done >> "$JS_CANDIDATES_FILE" 2>/dev/null || true
-
-  # parse <script src> from root.html
+  # Parse <script src> from root.html
   if [ -f "$RAW_DIR/root.html" ]; then
     grep -Eo "<script[^>]+src=[\"']?([^\"'> ]+)" "$RAW_DIR/root.html" 2>/dev/null \
       | sed -E "s/.*src=['\"]?([^'\"]+).*/\1/" \
       | while read -r src; do
           if [[ "$src" =~ ^https?:// ]]; then
-            echo "$src"
+            echo "$src" | grep -i "$TARGET_FILTER"
           elif [[ "$src" =~ ^/ ]]; then
-            echo "${FINAL_URL%/}${src}"
+            echo "${FINAL_URL%/}${src}" | grep -i "$TARGET_FILTER"
           else
-            echo "${FINAL_URL%/}/${src#./}"
+            echo "${FINAL_URL%/}/${src#./}" | grep -i "$TARGET_FILTER"
           fi
         done >> "$JS_CANDIDATES_FILE" 2>/dev/null || true
   fi
-
-  # inline scripts
+  # Inline scripts
   if [ -f "$RAW_DIR/root.html" ]; then
     if grep -Pzo "(?s)<script[^>]*>(.*?)</script>" "$RAW_DIR/root.html" >/dev/null 2>&1; then
       grep -Pzo "(?s)<script[^>]*>(.*?)</script>" "$RAW_DIR/root.html" 2>/dev/null \
@@ -190,27 +226,23 @@ for TARGET_RAW in "${TARGETS[@]}"; do
       awk '/<script/{f=1;next}/<\/script>/{f=0}f{print}' "$RAW_DIR/root.html" > "$INLINE_JS" 2>/dev/null || true
     fi
   fi
-
-  # katana inline JS extraction
+  # Katana inline JS extraction
   if [ -f "$RAW_DIR/katana.txt" ] && command -v katana >/dev/null 2>&1; then
     echo " - extracting inline JS from katana pages"
     grep -E "<script[^>]*>" "$RAW_DIR/katana.txt" -A 1000 | \
       sed -n '1,/<script/p' | \
       sed -E 's/<script[^>]*>//g; s#</script>##g' >> "$INLINE_JS" 2>/dev/null || true
   fi
-
-  # fallback JS paths
+  # Fallback JS paths
   if [ ! -s "$JS_CANDIDATES_FILE" ]; then
     echo "[!] No external JS found — adding common fallbacks"
     echo "${FINAL_URL%/}/static/js/app.js" >> "$JS_CANDIDATES_FILE"
     echo "${FINAL_URL%/}/main.js" >> "$JS_CANDIDATES_FILE"
     echo "${FINAL_URL%/}/bundle.js" >> "$JS_CANDIDATES_FILE"
   fi
-
   sort -u "$JS_CANDIDATES_FILE" -o "$JS_CANDIDATES_FILE" || true
   JS_COUNT=$(wc -l < "$JS_CANDIDATES_FILE" 2>/dev/null || echo 0)
   echo "[+] JS candidates: $JS_COUNT"
-
   # --------------------
   # Phase 3: Download JS files
   # --------------------
@@ -219,7 +251,6 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   : > "$DOWNLOAD_LIST"
   : > "$DOWNLOAD_MAP"
   DOWNLOADED=0
-
   while read -r url || [ -n "$url" ]; do
     url="${url%%$'\r'}"
     [ -z "$url" ] && continue
@@ -246,12 +277,10 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     fi
   done < "$JS_CANDIDATES_FILE"
   echo "[+] Downloaded JS files: $DOWNLOADED"
-
   # --------------------
   # Phase 4: Analysis (LinkFinder, SecretFinder, regex)
   # --------------------
   echo "[+] Phase 4: Running LinkFinder & SecretFinder..."
-
   if [ -f "/opt/LinkFinder/linkfinder.py" ] || command -v linkfinder >/dev/null 2>&1; then
     for js in "$JS_DIR"/*.js; do
       [ -f "$js" ] || continue
@@ -265,7 +294,6 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   else
     echo " - LinkFinder not installed, skipping."
   fi
-
   if [ -f "/opt/SecretFinder/SecretFinder.py" ] || command -v SecretFinder >/dev/null 2>&1; then
     for js in "$JS_DIR"/*.js; do
       [ -f "$js" ] || continue
@@ -279,29 +307,24 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   else
     echo " - SecretFinder not installed, using fallback regex."
   fi
-
   grep -Eho "$SECRET_REGEX" "$JS_DIR"/*.js 2>/dev/null | sort -u > "$SECRETFINDER_DIR/fallback_secrets.txt" || true
   FALLBACK_COUNT=$(wc -l < "$SECRETFINDER_DIR/fallback_secrets.txt" 2>/dev/null || echo 0)
   echo " - Fallback secrets found: $FALLBACK_COUNT"
-
   # --------------------
   # Phase 5: Aggregate, categorize, validate
   # --------------------
   echo "[+] Phase 5: Aggregating endpoints..."
-
   : > "$ALL_RAW"
-  for f in "$LINKFINDER_DIR"/*.txt; do [ -f "$f" ] && cat "$f" >> "$ALL_RAW" 2>/dev/null || true; done
-  for f in "$SECRETFINDER_DIR"/*.txt; do [ -f "$f" ] && grep -Eo "https?://[^ \"']+" "$f" >> "$ALL_RAW" 2>/dev/null || true; done
+  for f in "$LINKFINDER_DIR"/*.txt; do [ -f "$f" ] && cat "$f" | grep -i "$TARGET_FILTER" >> "$ALL_RAW" 2>/dev/null || true; done
+  for f in "$SECRETFINDER_DIR"/*.txt; do [ -f "$f" ] && grep -Eo "https?://[^ \"']+" "$f" | grep -i "$TARGET_FILTER" >> "$ALL_RAW" 2>/dev/null || true; done
   cat "$RAW_ENDPOINTS" >> "$ALL_RAW" 2>/dev/null || true
-
   if [ -s "$ALL_RAW" ]; then
-    sed " losing [',\"]//g" "$ALL_RAW" | sed 's/#.*$//' | sort -u > "$SORTED" || true
+    sed 's/[",'\'' ]$//g' "$ALL_RAW" | sed 's/#.*$//' | sort -u > "$SORTED" || true
   else
     : > "$SORTED"
   fi
   TOTAL_ENDPOINTS=$(wc -l < "$SORTED" 2>/dev/null || echo 0)
   echo "[+] Candidate endpoints (uniq): $TOTAL_ENDPOINTS"
-
   # Categorize
   API_FILE="$FIND_DIR/api_endpoints.txt"
   ADMIN_FILE="$FIND_DIR/admin_endpoints.txt"
@@ -310,11 +333,9 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   grep -Ei "/api/|\.json" "$SORTED" | grep -Fvxf "$API_FILE" >> "$API_FILE" 2>/dev/null || true
   grep -Ei "/admin/|/admin$|/dashboard/|/wp-admin|/manage|/console|/administrator" "$SORTED" > "$ADMIN_FILE" 2>/dev/null || true
   grep -Ei "/upload/|/uploads/|/files/|/attachments/|/import/|/file-upload" "$SORTED" > "$UPLOAD_FILE" 2>/dev/null || true
-
   API_COUNT=$(wc -l < "$API_FILE" 2>/dev/null || echo 0)
   ADMIN_COUNT=$(wc -l < "$ADMIN_FILE" 2>/dev/null || echo 0)
   UPLOAD_COUNT=$(wc -l < "$UPLOAD_FILE" 2>/dev/null || echo 0)
-
   # Validate with httpx
   VALIDATED_COUNT=0
   if command -v httpx >/dev/null 2>&1; then
@@ -324,49 +345,99 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   else
     echo " - httpx not installed; skipping validation"
   fi
-
   # Katana validation
   if [ -f "$RAW_DIR/katana.txt" ] && command -v httpx >/dev/null 2>&1; then
     echo "[+] Validating Katana endpoints..."
     grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/katana.txt" | sort -u | \
       httpx -silent -status-code -threads 40 -o "$KATANA_VALIDATED" || true
   fi
-
   # --------------------
   # Phase 5.5: Arjun parameter discovery
   # --------------------
   echo "[+] Phase 5.5: Discovering hidden parameters with Arjun..."
   grep -v "\?" "$SORTED" | head -100 > "$PARAMLESS_FILE" 2>/dev/null || true
   ARJUN_DISCOVERED=0
-
   if command -v arjun >/dev/null 2>&1 && [ -s "$PARAMLESS_FILE" ]; then
     echo " - Running Arjun on $(wc -l < "$PARAMLESS_FILE") param-less endpoints..."
+    if [ -s "$CEWL_WORDLIST" ]; then
+      echo " - Using CeWL wordlist for Arjun"
+      ARJUN_WORDLIST_OPT="-w $CEWL_WORDLIST"
+    else
+      ARJUN_WORDLIST_OPT=""
+    fi
     ARJUN_COUNT=0
     while read -r url || [ -n "$url" ]; do
       [ -z "$url" ] && continue
       temp_out=$(mktemp)
-      timeout 60 arjun -u "$url" -m GET,POST --stable --no-colors > "$temp_out" 2>/dev/null || true
+      timeout 60 arjun -u "$url" -m GET,POST --stable --no-colors $ARJUN_WORDLIST_OPT > "$temp_out" 2>/dev/null || true
       grep -E "^\[\+\] Parameter.*\(.*\): .*" "$temp_out" 2>/dev/null | \
         sed -E 's/^\[(\+|\-)\] Parameter: ([^ ]+) \(Status: ([0-9]+)\): .*/\1 \2/' | \
         grep "^\+ " | \
         awk -v url="$url" '{print url (index(url, "?") > 0 ? "&" : "?") $2 "=DUMMY"}' >> "$ARJUN_PARAMS" 2>/dev/null || true
       rm -f "$temp_out"
       ARJUN_COUNT=$((ARJUN_COUNT+1))
-      [ $((ARJUN_COUNT % 10)) -eq 0 ] && echo "   - Processed $ARJUN_COUNT"
+      [ $((ARJUN_COUNT % 10)) -eq 0 ] && echo " - Processed $ARJUN_COUNT"
     done < "$PARAMLESS_FILE"
     sort -u "$ARJUN_PARAMS" -o "$ARJUN_PARAMS" || true
     ARJUN_DISCOVERED=$(wc -l < "$ARJUN_PARAMS" 2>/dev/null || echo 0)
-    echo " - Discovered $ARJUN_DISCOVERED new parameterized URLs"
+    echo " - Discovered $ARJUN_DISCOVERED new parameterized URLs with Arjun"
   else
     echo " - Arjun not installed or no param-less endpoints; skipping."
   fi
-
+  # --------------------
+  # Phase 5.6: ParamSpider parameter discovery
+  # --------------------
+  echo "[+] Phase 5.6: Discovering parameters with ParamSpider..."
+  PARAMSPIDER_DISCOVERED=0
+  if command -v paramspider >/dev/null 2>&1; then
+    paramspider -d "$TARGET_FILTER" -l high -o "$PARAMSPIDER_PARAMS" 2>/dev/null || true
+    sort -u "$PARAMSPIDER_PARAMS" -o "$PARAMSPIDER_PARAMS" || true
+    PARAMSPIDER_DISCOVERED=$(wc -l < "$PARAMSPIDER_PARAMS" 2>/dev/null || echo 0)
+    echo " - Discovered $PARAMSPIDER_DISCOVERED parameters with ParamSpider"
+  else
+    echo " - ParamSpider not installed; skipping."
+  fi
+  # --------------------
+  # Phase 5.7: GF patterns for potential vulnerabilities (parallel if possible)
+  # --------------------
+  echo "[+] Phase 5.7: Applying GF patterns to endpoints..."
+  GF_COUNTS=()
+  if command -v gf >/dev/null 2>&1 && [ -s "$SORTED" ]; then
+    if command -v parallel >/dev/null 2>&1; then
+      echo " - Using GNU parallel for GF (optimized)"
+      printf '%s\n' "${GF_PATTERNS[@]}" | parallel -j0 'cat "$SORTED" | gf {} 2>/dev/null | sort -u > "$GF_DIR/{}.txt" || true'
+    else
+      echo " - Sequential GF (install parallel for speedup)"
+      for pattern in "${GF_PATTERNS[@]}"; do
+        cat "$SORTED" | gf "$pattern" 2>/dev/null | sort -u > "$GF_DIR/${pattern}.txt" || true
+      done
+    fi
+    for pattern in "${GF_PATTERNS[@]}"; do
+      count=$(wc -l < "$GF_DIR/${pattern}.txt" 2>/dev/null || echo 0)
+      GF_COUNTS+=("${pattern^^}: ${count}")
+      echo " - GF $pattern: $count endpoints"
+    done
+  else
+    echo " - GF not installed or no endpoints; skipping."
+    for pattern in "${GF_PATTERNS[@]}"; do
+      GF_COUNTS+=("${pattern^^}: 0")
+    done
+  fi
   # --------------------
   # Phase 6: HTML report
   # --------------------
   echo "[+] Phase 6: Generating HTML report..."
   KATANA_COUNT=$( [ -f "$RAW_DIR/katana.txt" ] && wc -l < "$RAW_DIR/katana.txt" 2>/dev/null || echo 0 )
-
+  GOSPIDER_COUNT=$( [ -f "$RAW_DIR/gospider.txt" ] && wc -l < "$RAW_DIR/gospider.txt" 2>/dev/null || echo 0 )
+  CEWL_COUNT=$( [ -f "$CEWL_WORDLIST" ] && wc -l < "$CEWL_WORDLIST" 2>/dev/null || echo 0 )
+  GF_SUMMARY=""
+  for gc in "${GF_COUNTS[@]}"; do
+    GF_SUMMARY+="<div>GF $gc</div>"
+  done
+  GF_SECTIONS=""
+  for pattern in "${GF_PATTERNS[@]}"; do
+    GF_SECTIONS+="<section><h2>GF ${pattern^^} Endpoints</h2><pre>$( [ -s "$GF_DIR/${pattern}.txt" ] && sed -n '1,1000p' "$GF_DIR/${pattern}.txt" || echo "None")</pre></section>"
+  done
   cat > "$HTML_REPORT" <<HTML_EOF
 <!doctype html>
 <html lang="en">
@@ -400,8 +471,12 @@ a:hover{text-decoration:underline;}
   <div>Upload endpoints: ${UPLOAD_COUNT}</div>
   <div>Validated endpoints: ${VALIDATED_COUNT}</div>
   <div>Katana endpoints: ${KATANA_COUNT}</div>
+  <div>GoSpider endpoints: ${GOSPIDER_COUNT}</div>
   <div>Arjun params discovered: ${ARJUN_DISCOVERED}</div>
+  <div>ParamSpider params discovered: ${PARAMSPIDER_DISCOVERED}</div>
+  <div>CeWL words: ${CEWL_COUNT}</div>
   <div>Fallback secrets: ${FALLBACK_COUNT}</div>
+  ${GF_SUMMARY}
 </div>
 </section>
 <section><h2>API Endpoints</h2><pre>$( [ -s "$API_FILE" ] && sed -n '1,1000p' "$API_FILE" || echo "None")</pre></section>
@@ -415,12 +490,13 @@ $(if [ -s "$SORTED" ]; then while read -r u; do echo "<a href=\"$u\">$u</a>"; do
 <section><h2>Validated Endpoints (httpx)</h2><pre>$( [ -s "$VALIDATED" ] && sed -n '1,1000p' "$VALIDATED" || echo "None or httpx not installed")</pre></section>
 <section><h2>Katana Validated Endpoints</h2><pre>$( [ -s "$KATANA_VALIDATED" ] && sed -n '1,1000p' "$KATANA_VALIDATED" || echo "None")</pre></section>
 <section><h2>Arjun Discovered Parameters</h2><pre>$( [ -s "$ARJUN_PARAMS" ] && sed -n '1,1000p' "$ARJUN_PARAMS" || echo "None or Arjun not installed")</pre></section>
+<section><h2>ParamSpider Discovered Parameters</h2><pre>$( [ -s "$PARAMSPIDER_PARAMS" ] && sed -n '1,1000p' "$PARAMSPIDER_PARAMS" || echo "None or ParamSpider not installed")</pre></section>
+<section><h2>CeWL Wordlist (Top 100)</h2><pre>$( [ -s "$CEWL_WORDLIST" ] && sed -n '1,100p' "$CEWL_WORDLIST" || echo "None or CeWL not installed")</pre></section>
+${GF_SECTIONS}
 </body>
 </html>
 HTML_EOF
-
   echo "[+] HTML report: $HTML_REPORT"
-
   # --------------------
   # Final console summary
   # --------------------
@@ -429,11 +505,15 @@ HTML_EOF
   echo "JS candidates: $JS_COUNT | Downloaded: $DOWNLOADED"
   echo "Candidate endpoints: ${TOTAL_ENDPOINTS}"
   echo "API: ${API_COUNT} | Admin: ${ADMIN_COUNT} | Upload: ${UPLOAD_COUNT}"
-  echo "Katana: ${KATANA_COUNT} | Arjun params: ${ARJUN_DISCOVERED}"
+  echo "Katana: ${KATANA_COUNT} | GoSpider: ${GOSPIDER_COUNT}"
+  echo "Arjun params: ${ARJUN_DISCOVERED} | ParamSpider params: ${PARAMSPIDER_DISCOVERED}"
+  echo "CeWL words: ${CEWL_COUNT}"
   echo "Fallback secrets: ${FALLBACK_COUNT}"
+  for gc in "${GF_COUNTS[@]}"; do
+    echo "GF $gc"
+  done
   echo "Report: $HTML_REPORT"
   echo "-------------------------------------"
 done
-
 echo "All targets processed. Check OUT/ for results."
 exit 0
