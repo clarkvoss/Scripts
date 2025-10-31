@@ -33,7 +33,7 @@ FIGLET_LINES=(
 )
 
 # Subtitle
-SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration${RESET}"
+SUBTITLE="${BOLD}${WHITE}JavaScript-Driven Endpoint Discovery & Parameter Enumeration By Clark Voss${RESET}"
 TOOLS="${CYAN}• LinkFinder • SecretFinder • Arjun • ParamSpider • GF • httpx • katana • gospider${RESET}"
 
 # Animation function
@@ -165,7 +165,7 @@ log() {
 # --------------------
 # Dependency check
 # --------------------
-REQS=(waybackurls gau hakrawler httpx katana arjun gospider paramspider cewl gf parallel curl jq sort)
+REQS=(~/go/bin/waybackurls ~/go/bin/gau ~/go/bin/hakrawler httpx katana arjun ~/go/bin/gospider paramspider ~/CeWL/cewl.rb gf parallel curl jq sort)
 for r in "${REQS[@]}"; do
   command -v "$r" >/dev/null 2>&1 || log "WARN" "$r not found"
 done
@@ -232,11 +232,11 @@ for TARGET_RAW in "${TARGETS[@]}"; do
 
   WAYBACK_PID="" GAU_PID="" KATANA_PID="" GOSPIDER_PID=""
 
-  if command -v waybackurls >/dev/null; then
+  if command -v ~/go/bin/waybackurls >/dev/null; then
     (echo "$TARGET_RAW" | waybackurls > "$RAW_DIR/wayback.txt" 2>"$OUT_DIR/wayback.err") &
     WAYBACK_PID=$!
   fi
-  if command -v gau >/dev/null; then
+  if command -v ~/go/bin/gau >/dev/null; then
     (gau "$TARGET_RAW" > "$RAW_DIR/gau.txt" 2>"$OUT_DIR/gau.err") &
     GAU_PID=$!
   fi
@@ -247,7 +247,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
 
   [[ ! -s "$RAW_ENDPOINTS" ]] && echo "$FINAL_URL" > "$RAW_ENDPOINTS"
 
-  if command -v hakrawler >/dev/null; then
+  if command -v ~/go/bin/hakrawler >/dev/null; then
     cat "$RAW_ENDPOINTS" | hakrawler -subs -d 2 > "$RAW_DIR/haka.txt" 2>"$OUT_DIR/haka.err"
     grep -Eo "https?://[^ \"'<>]+" "$RAW_DIR/haka.txt" | grep -i "$TARGET_FILTER" >> "$RAW_ENDPOINTS"
   fi
@@ -256,7 +256,7 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     (timeout 120 katana -u "$FINAL_URL" -d 3 -jc -hl -silent -o "$RAW_DIR/katana.txt" 2>"$OUT_DIR/katana.err") &
     KATANA_PID=$!
   fi
-  if command -v gospider >/dev/null; then
+  if command -v ~/go/bin/gospider >/dev/null; then
     (gospider -s "$FINAL_URL" -d 3 -c 10 -t 20 --quiet > "$RAW_DIR/gospider.txt" 2>"$OUT_DIR/gospider.err") &
     GOSPIDER_PID=$!
   fi
@@ -278,8 +278,8 @@ for TARGET_RAW in "${TARGETS[@]}"; do
   log "INFO" "Total harvested endpoints: $(wc -l < "$RAW_ENDPOINTS")"
 
   # CeWL
-  if command -v cewl >/dev/null; then
-    cewl -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>"$OUT_DIR/cewl.err"
+  if command -v ~/CEWL/cewl.rb >/dev/null; then
+    ~/CeWL/cewl.rb -d 3 -m 5 -w "$CEWL_WORDLIST" "$FINAL_URL" 2>"$OUT_DIR/cewl.err"
     log "INFO" "CeWL wordlist: $(wc -l < "$CEWL_WORDLIST") words"
   fi
 
@@ -347,8 +347,8 @@ for TARGET_RAW in "${TARGETS[@]}"; do
       ((i++))
       [[ ! -f "$js" ]] && continue
       base=$(basename "$js")
-      if [[ -f /opt/LinkFinder/linkfinder.py ]]; then
-        python3 /opt/LinkFinder/linkfinder.py -i "$js" -o cli 2>/dev/null | sed '/^\s*$/d' > "$LINKFINDER_DIR/${base}.txt"
+      if [[ -f ~/LinkFinder/linkfinder.py ]]; then
+        python3.9 ~/LinkFinder/linkfinder.py -i "$js" -o cli 2>/dev/null | sed '/^\s*$/d' > "$LINKFINDER_DIR/${base}.txt"
       else
         linkfinder -i "$js" -o cli > "$LINKFINDER_DIR/${base}.txt" 2>/dev/null
       fi
@@ -357,15 +357,15 @@ for TARGET_RAW in "${TARGETS[@]}"; do
     echo
   fi
 
-  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f /opt/SecretFinder/SecretFinder.py ]] || command -v SecretFinder >/dev/null; then
+  if [[ $JS_FILES_COUNT -gt 0 ]] && [[ -f ~/SecretFinder/SecretFinder.py ]] || command -v SecretFinder >/dev/null; then
     log "INFO" "Phase 4: Running SecretFinder..."
     i=0
     for js in "${JS_FILES[@]}"; do
       ((i++))
       [[ ! -f "$js" ]] && continue
       base=$(basename "$js")
-      if [[ -f /opt/SecretFinder/SecretFinder.py ]]; then
-        python3 /opt/SecretFinder/SecretFinder.py -i "$js" -o cli 2>/dev/null > "$SECRETFINDER_DIR/${base}.txt"
+      if [[ -f ~/SecretFinder/SecretFinder.py ]]; then
+        python3.9 ~/SecretFinder/SecretFinder.py -i "$js" -o cli 2>/dev/null > "$SECRETFINDER_DIR/${base}.txt"
       else
         SecretFinder -i "$js" -o cli > "$SECRETFINDER_DIR/${base}.txt" 2>/dev/null
       fi
